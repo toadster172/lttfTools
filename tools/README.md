@@ -1,0 +1,1 @@
+convTGA: Takes an input directory as a required command line argument, and then will check whether each file in the directory may be interpreted as a valid DS BTGA. For files where this is possible, it will generate a standard TGA conversion. Compilation requires an implementation of `dirent.h`. 
