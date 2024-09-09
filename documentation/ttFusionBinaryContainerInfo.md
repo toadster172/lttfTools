@@ -4,7 +4,8 @@ Many of the binary files used in TT Fusion games are encapsulated within an unna
 ### Segment Format
 | Offset                | Data Type            | Note / Significance |
 | --------------------- | -------------------- | ------------------- |
-| `0x00`                | `uint32_t`           | Number of blocks in segment |
+| `0x00`                | `uint16_t`           | Number of blocks in segment |
+| `0x02`                | `uint8_t[2]`         | Padding                     |
 | `0x04`                | `uint32_t`           | Length of segment data      |
 | `0x08`                | `uint32_t[blocks]`   | Size in bytes of each block |
 | `0x08 + (blocks * 4)` | `uint8_t[dataLength]`| Segment data                |
