@@ -89,6 +89,7 @@ uint8_t verifyPalettes(uint16_t *indexData, ttfTGAHeader *header);
 uint32_t *genBasePalette(segmentHeader *source, uint8_t color0Transparent);
 uint32_t *genA5I3Palette(uint32_t *basePalette, uint8_t numColors);
 uint32_t *genA3I5Palette(uint32_t *basePalette, uint8_t numColors);
+uint32_t blend888(const uint32_t color0, const uint32_t color1, const int mix0, const int mix1);
 
 uint32_t *convBodyDataDC(uint16_t *bodyData, uint32_t res);
 uint32_t *convBodyDataPalette(uint8_t *bodyData, uint32_t *palette, uint32_t res, uint8_t bpp);
@@ -378,6 +379,15 @@ uint32_t *genA3I5Palette(uint32_t *basePalette, uint8_t numColors) {
     return fullPalette;
 }
 
+uint32_t blend888(const uint32_t color0, const uint32_t color1, const int mix0, const int mix1) {
+    const int mixTotal = mix0 + mix1;
+    const uint32_t componentOne = (((color0 >> 16) & 0xFF) * mix0 + ((color1 >> 16) & 0xFF) * mix1) / mixTotal;
+    const uint32_t componentTwo = (((color0 >> 8) & 0xFF) * mix0 + ((color1 >> 8) & 0xFF) * mix1) / mixTotal;
+    const uint32_t componentThree = ((color0 & 0xFF) * mix0 + (color1 & 0xFF) * mix1) / mixTotal;
+
+    return (componentOne << 16) | (componentTwo << 8) | componentThree;
+}
+
 uint32_t *convBodyDataDC(uint16_t *bodyData, uint32_t res) {
     uint32_t *imageData = malloc(sizeof(uint32_t) * res);
 
@@ -430,7 +440,7 @@ uint32_t *convBodyDataCompressed(uint32_t *bodyData, ttfTGAFile *segments, uint3
                 blockPalette[3] = 0;
                 break;
             case 1:
-                blockPalette[2] = 0xFF000000 | ((blockPalette[0] + blockPalette[1]) / 2);
+                blockPalette[2] = 0xFF000000 | blend888(blockPalette[0], blockPalette[1], 1, 1);
                 blockPalette[3] = 0;
                 break;
             case 2:
@@ -438,8 +448,8 @@ uint32_t *convBodyDataCompressed(uint32_t *bodyData, ttfTGAFile *segments, uint3
                 blockPalette[3] = paletteBase[3];
                 break;
             case 3:
-                blockPalette[2] = 0xFF000000 | ((blockPalette[0] * 5 + blockPalette[1] * 3) / 8);
-                blockPalette[2] = 0xFF000000 | ((blockPalette[0] * 3 + blockPalette[1] * 5) / 8);
+                blockPalette[2] = 0xFF000000 | blend888(blockPalette[0], blockPalette[1], 5, 3);
+                blockPalette[3] = 0xFF000000 | blend888(blockPalette[0], blockPalette[1], 3, 5);
                 break;
         }
 
