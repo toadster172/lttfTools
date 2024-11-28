@@ -421,7 +421,7 @@ uint32_t *convBodyDataCompressed(uint32_t *bodyData, ttfTGAFile *segments, uint3
     const uint32_t blocks = segments->header->bodyLength / 4;
     const uint32_t width = segments->header->hres;
     const uint32_t hBlocks = width / 4;
-    const uint16_t *indexTable = segments->paletteIndexSegment->segmentData;
+    const uint16_t *indexTable = (uint16_t *) segments->paletteIndexSegment->segmentData;
     uint32_t *imageData = malloc(sizeof(uint32_t) * width * segments->header->vres);
 
     uint32_t blockPalette[4];
