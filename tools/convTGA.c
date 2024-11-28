@@ -561,7 +561,6 @@ char *tryTGAConv(char *path) {
 
         if(paletteIndexSeg->segmentLength != header->paletteIndexLength) {
             freeAll(fileInfo);
-            fclose(inputFile);
             return "Palette index's length does not match what is reported in header!\n";
         }
 
