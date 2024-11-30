@@ -16,29 +16,58 @@
 
 // This code currently makes assumptions about padding and endianness.
 // As such, it is non-portable, though will probably work on all modern desktop systems.
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <dirent.h>
 
-typedef struct _segmentHeader {
-    uint16_t totalBlocks;
-    uint8_t padding[2];
-    uint32_t segmentLength;
+// typedef struct _segmentHeader {
+//     uint16_t totalBlocks;
+//     uint8_t padding[2];
+//     uint32_t segmentLength;
+// 
+//     uint32_t *blockSizes;
+//     uint8_t *segmentData;
+// } segmentHeader;
 
-    uint32_t *blockSizes;
-    uint8_t *segmentData;
-} segmentHeader;
+typedef struct _blockParser {
+    bool rereadSizes;
+    // Structural info
+    uint32_t numSizeEntries;
+    int32_t *blockSizes;
+    uint32_t sizeIndex;
+    // Exposed return info
+    uint32_t dataLen;
+    uint8_t *blockData;
+    // Version-specific return info
+    bool newSegmentFlag; // Versions 1-3, set to true when block is the first of its segment
+    uint32_t segmentLength; // Versions 1-3, set to total length of segment
+    
+    uint32_t sizesInBlock; // Version 4, set to the number of size entries making up the block, minus the magic number
+    int32_t blockBank; // Version 4, set to block's magic number (requires additional research)
+} blockParser;
 
-typedef struct _ttfTGAHeader {
+enum dsTextureFormat {
+    NO_TEXTURE,
+    A3I5,
+    PALETTE_2_BPP,
+    PALETTE_4_BPP,
+    PALETTE_8_BPP,
+    COMPRESSED,
+    A5I3,
+    DIRECT_TEXTURE
+};
+
+typedef struct _dsBTGAHeader {
     uint32_t clobbered0;
     uint32_t bodyLength;
     uint32_t clobbered1;
     uint32_t paletteLength;
     uint32_t clobbered2;
     uint32_t paletteIndexLength;
-    uint8_t textureFormat;
+    enum dsTextureFormat textureFormat;
     uint8_t color0Transparent;
     uint8_t hwidth;
     uint8_t hheight;
@@ -49,16 +78,15 @@ typedef struct _ttfTGAHeader {
     uint32_t vres; // 8 << hheight
     uint8_t indexBits;
     const uint8_t *alphaConvTable;
-} ttfTGAHeader;
+} dsBTGAHeader;
 
-// Stores all allocated buffers by the program to limit number of free calls
+// Stores allocated buffers for easier cleanup
 typedef struct _ttfTGAFile {
-    segmentHeader *headerSegment;
-    segmentHeader *bodySegment;
-    segmentHeader *paletteSegment;
-    segmentHeader *paletteIndexSegment;
+    uint8_t *bodySegment;
+    uint16_t *paletteSegment;
+    uint16_t *paletteIndexSegment;
 
-    ttfTGAHeader *header;
+    blockParser *parser;
 } ttfTGAFile;
 
 // Lookup tables to convert color spaces to 8 bit depth
@@ -77,23 +105,24 @@ const uint8_t colorConv1[2]  = {0xFF, 0xFF}; // For alpha bit
                         (colorConv5[((X) & 0x03E0) >> 5] << 8) | \
                         (colorConv5[((X) & 0x7C00) >> 10]))
 
-segmentHeader *readSegment(FILE *inFile, long fileLength);
-void freeSegment(segmentHeader *seg);
-void freeAll(ttfTGAFile segments);
+bool readV1Block(blockParser *parser, FILE *inFile, long fileLength);
 
-ttfTGAHeader *readHeader(segmentHeader *source);
+void freeAll(ttfTGAFile *buffers);
 
-uint8_t verifyColors(uint8_t *bodyData, ttfTGAHeader *header);
-uint8_t verifyPalettes(uint16_t *indexData, ttfTGAHeader *header);
+// Verifies if current block is a valid BTGA header. Frees block before returning on success
+bool processHeader(blockParser *source, dsBTGAHeader *header);
 
-uint32_t *genBasePalette(segmentHeader *source, uint8_t color0Transparent);
+uint8_t verifyColors(uint8_t *bodyData, dsBTGAHeader *header);
+uint8_t verifyPalettes(uint16_t *indexData, dsBTGAHeader *header);
+
+uint32_t *genBasePalette(uint16_t *source, uint32_t length, uint8_t color0Transparent);
 uint32_t *genA5I3Palette(uint32_t *basePalette, uint8_t numColors);
 uint32_t *genA3I5Palette(uint32_t *basePalette, uint8_t numColors);
 uint32_t blend888(const uint32_t color0, const uint32_t color1, const int mix0, const int mix1);
 
 uint32_t *convBodyDataDC(uint16_t *bodyData, uint32_t res);
 uint32_t *convBodyDataPalette(uint8_t *bodyData, uint32_t *palette, uint32_t res, uint8_t bpp);
-uint32_t *convBodyDataCompressed(uint32_t *bodyData, ttfTGAFile *segments, uint32_t *palette);
+uint32_t *convBodyDataCompressed(uint32_t *bodyData, uint32_t *palette, uint16_t *indexTable, dsBTGAHeader *header);
 
 char *tryTGAConv(char *path);
 
@@ -138,134 +167,146 @@ int main(int argc, char *argv[]) {
     return 0;
 }
 
-segmentHeader *readSegment(FILE *inFile, long fileLength) {
-    long currentPos = ftell(inFile);
+bool readV1Block(blockParser *parser, FILE *inFile, long fileLength) {
+    if(!parser->blockSizes) {
+        long currentPos = ftell(inFile);
 
-    if(currentPos + 0x0C > fileLength) {
-        return NULL;
+        if(currentPos + 0x08 > fileLength) {
+            return false;
+        }
+
+        uint16_t numBlocks;
+
+        size_t readLen = fread(&numBlocks, 0x02, 0x01, inFile);
+
+        if(readLen != 0x01 || !numBlocks) {
+            return false;
+        }
+
+        parser->numSizeEntries = numBlocks;
+        fseek(inFile, 2, SEEK_CUR);
+
+        readLen = fread(&parser->segmentLength, 0x04, 0x01, inFile);
+
+        if(readLen != 0x01 || !parser->segmentLength ||
+            currentPos + 0x08 + parser->numSizeEntries * 4 + parser->segmentLength > fileLength) {
+            return false;
+        }
+
+        parser->blockSizes = malloc(parser->numSizeEntries * 4);
+
+        fread(parser->blockSizes, 4, parser->numSizeEntries, inFile);
+
+        uint32_t totalLen = 0;
+        for(int i = 0; i < parser->numSizeEntries; i++) {
+            totalLen += parser->blockSizes[i];
+        }
+
+        if(totalLen != parser->segmentLength) {
+            free(parser->blockSizes);
+            return false;
+        }
+
+        parser->sizeIndex = 0;
+        parser->newSegmentFlag = true;
+    } else {
+        parser->newSegmentFlag = false;
     }
 
-    segmentHeader *segment = malloc(sizeof(segmentHeader));
+    parser->dataLen = parser->blockSizes[parser->sizeIndex];
+    parser->blockData = malloc(parser->dataLen);
     
-    size_t readLen = fread(&segment->totalBlocks, 0x04, 0x01, inFile);
-
-    if(readLen != 0x01 || !segment->totalBlocks) {
-        free(segment);
-        return NULL;
+    if(!fread(parser->blockData, parser->dataLen, 1, inFile)) {
+        free(parser->blockData);
+        free(parser->blockSizes);
+        return false;
     }
 
-    readLen = fread(&segment->segmentLength, 0x04, 0x01, inFile);
-
-    if(readLen != 0x01 || !segment->segmentLength ||
-        currentPos + 0x08 + segment->totalBlocks * 4 + segment->segmentLength > fileLength) {
-        free(segment);
-        return NULL;
+    parser->sizeIndex++;
+    if(parser->sizeIndex == parser->numSizeEntries) {
+        free(parser->blockSizes);
+        parser->blockSizes = NULL;
     }
 
-    segment->blockSizes = malloc(segment->totalBlocks * 4);
-
-    fread(segment->blockSizes, 4, segment->totalBlocks, inFile);
-
-    // BTGAs always use one block to a segment
-    if(segment->blockSizes[0] != segment->segmentLength) {
-        free(segment->blockSizes);
-        free(segment);
-        return NULL;
-    }
-
-    segment->segmentData = malloc(segment->segmentLength);
-    fread(segment->segmentData, 1, segment->segmentLength, inFile);
-
-    return segment;
+    return true;
 }
 
-void freeSegment(segmentHeader *seg) {
-    if(!seg) {
-        return;
+void freeAll(ttfTGAFile *buffers) {
+    free(buffers->bodySegment);
+    free(buffers->paletteSegment);
+    free(buffers->paletteIndexSegment);
+
+    free(buffers->parser->blockSizes);
+    free(buffers->parser->blockData);
+}
+
+bool processHeader(blockParser *source, dsBTGAHeader *header) {
+    if(source->dataLen != 0x1C) {
+        return false;
     }
 
-    free(seg->blockSizes);
-    free(seg->segmentData);
-    free(seg);
-}
-
-void freeAll(ttfTGAFile segments) {
-    freeSegment(segments.headerSegment);
-    freeSegment(segments.bodySegment);
-    freeSegment(segments.paletteSegment);
-    freeSegment(segments.paletteIndexSegment);
-
-    free(segments.header);
-}
-
-ttfTGAHeader *readHeader(segmentHeader *source) {
-    ttfTGAHeader *header = malloc(sizeof(ttfTGAHeader));
-
-    memcpy(&header->clobbered0, source->segmentData, 4);
-    memcpy(&header->bodyLength, source->segmentData + 0x04, 4);
-    memcpy(&header->clobbered1, source->segmentData + 0x08, 4);
-    memcpy(&header->paletteLength, source->segmentData + 0x0C, 4);
-    memcpy(&header->clobbered2, source->segmentData + 0x10, 4);
-    memcpy(&header->paletteIndexLength, source->segmentData + 0x14, 4);
-    memcpy(&header->textureFormat, source->segmentData + 0x18, 1);
-    memcpy(&header->color0Transparent, source->segmentData + 0x19, 1);
-    memcpy(&header->hwidth, source->segmentData + 0x1A, 1);
-    memcpy(&header->hheight, source->segmentData + 0x1B, 1);
+    uint8_t formatByte;
+    
+    memcpy(&header->clobbered0, source->blockData, 4);
+    memcpy(&header->bodyLength, source->blockData + 0x04, 4);
+    memcpy(&header->clobbered1, source->blockData + 0x08, 4);
+    memcpy(&header->paletteLength, source->blockData + 0x0C, 4);
+    memcpy(&header->clobbered2, source->blockData + 0x10, 4);
+    memcpy(&header->paletteIndexLength, source->blockData + 0x14, 4);
+    memcpy(&formatByte, source->blockData + 0x18, 1);
+    header->textureFormat = formatByte;
+    memcpy(&header->color0Transparent, source->blockData + 0x19, 1);
+    memcpy(&header->hwidth, source->blockData + 0x1A, 1);
+    memcpy(&header->hheight, source->blockData + 0x1B, 1);
 
     // Paletted texture missing palette
     if(!header->paletteLength && header->textureFormat != 0x07) {
-        free(header);
-        return NULL;
+        return false;
     }
 
     // Compressed texture missing segment
     if(!header->paletteIndexLength && header->textureFormat == 0x05) {
-        free(header);
-        return NULL;
+        return false;
     }
 
     switch(header->textureFormat) {
-        case 0x00: // No texture
-            free(header);
-            return NULL;
+        case NO_TEXTURE:
+            return false;
             break;
-        case 0x01: // A3I5 texture
+        case A3I5:
             header->bpp = 8;
             header->indexBits = 5;
             header->alphaConvTable = colorConv3;
             break;
-        case 0x02: // 2-bit palette texture
+        case PALETTE_2_BPP:
             header->bpp = 2;
             header->indexBits = 2;
             break;
-        case 0x03: // 4-bit palette texture
+        case PALETTE_4_BPP:
             header->bpp = 4;
             header->indexBits = 4;
             break;
-        case 0x04: // 8-bit palette texture
+        case PALETTE_8_BPP:
             header->bpp = 8;
             header->indexBits = 8;
             break;
-        case 0x05: // Compressed texture
+        case COMPRESSED:
             if(header->paletteIndexLength != header->bodyLength / 2) {
-                free(header);
-                return NULL;
+                return false;
             }
 
             header->bpp = 2;
-
             break;
-        case 0x06: // A5I3 texture
+        case A5I3:
             header->bpp = 8;
             header->indexBits = 3;
             header->alphaConvTable = colorConv5;
             break;
-        case 0x07: // Direct color texture
+        case DIRECT_TEXTURE:
             header->bpp = 16;
             break;
         default:
-            free(header);
-            return NULL;
+            return false;
     }
 
     header->hres = 8 << header->hwidth;
@@ -273,15 +314,17 @@ ttfTGAHeader *readHeader(segmentHeader *source) {
 
     // Body length not matching resolution
     if(header->hres * header->vres * header->bpp != header->bodyLength * 8) {
-        free(header);
         return NULL;
     }
+
+    free(source->blockData);
+    source->blockData = NULL;
 
     return header;
 }
 
 // Return 0 if an invalid palette index is used
-uint8_t verifyColors(uint8_t *bodyData, ttfTGAHeader *header) {
+uint8_t verifyColors(uint8_t *bodyData, dsBTGAHeader *header) {
     const uint8_t indexMask = (1 << header->indexBits) - 1;
     const uint8_t bpp = header->bpp;
     const uint8_t ppB = 4 >> (bpp >> 2);
@@ -304,7 +347,7 @@ uint8_t verifyColors(uint8_t *bodyData, ttfTGAHeader *header) {
 }
 
 // Return 0 if a compressed texture's palette indexing table points to an invalid palette 
-uint8_t verifyPalettes(uint16_t *indexData, ttfTGAHeader *header) {
+uint8_t verifyPalettes(uint16_t *indexData, dsBTGAHeader *header) {
     const uint32_t indexEntries = header->paletteIndexLength / 2;
 
     for(int i = 0; i < indexEntries; i++) {
@@ -317,21 +360,19 @@ uint8_t verifyPalettes(uint16_t *indexData, ttfTGAHeader *header) {
 }
 
 // Convert 16-bit DS palettes to true color BGRA
-uint32_t *genBasePalette(segmentHeader *source, uint8_t color0Transparent) {
-    int paletteSize = source->segmentLength / 2;
+uint32_t *genBasePalette(uint16_t *source, uint32_t length, uint8_t color0Transparent) {
+    int paletteSize = length / 2;
 
     uint32_t *palette = malloc(paletteSize * 4);
 
-    uint16_t *sourcePalette = (uint16_t *) source->segmentData;
-
     if(color0Transparent) {
-        palette[0] = CONVRGB555(sourcePalette[0]) & 0x00FFFFFF;
+        palette[0] = CONVRGB555(source[0]) & 0x00FFFFFF;
     } else {
-        palette[0] = CONVRGB555(sourcePalette[0]);
+        palette[0] = CONVRGB555(source[0]);
     }
 
     for(int i = 1; i < paletteSize; i++) {
-        palette[i] = CONVRGB555(sourcePalette[i]);
+        palette[i] = CONVRGB555(source[i]);
     }
 
     return palette;
@@ -417,12 +458,11 @@ uint32_t *convBodyDataPalette(uint8_t *bodyData, uint32_t *palette, uint32_t res
     return imageData;
 }
 
-uint32_t *convBodyDataCompressed(uint32_t *bodyData, ttfTGAFile *segments, uint32_t *palette) {
-    const uint32_t blocks = segments->header->bodyLength / 4;
-    const uint32_t width = segments->header->hres;
+uint32_t *convBodyDataCompressed(uint32_t *bodyData, uint32_t *palette, uint16_t *indexTable, dsBTGAHeader *header) {
+    const uint32_t blocks = header->bodyLength / 4;
+    const uint32_t width = header->hres;
     const uint32_t hBlocks = width / 4;
-    const uint16_t *indexTable = (uint16_t *) segments->paletteIndexSegment->segmentData;
-    uint32_t *imageData = malloc(sizeof(uint32_t) * width * segments->header->vres);
+    uint32_t *imageData = malloc(sizeof(uint32_t) * width * header->vres);
 
     uint32_t blockPalette[4];
 
@@ -484,128 +524,119 @@ char *tryTGAConv(char *path) {
     ttfTGAFile fileInfo;
     memset(&fileInfo, 0, sizeof(fileInfo));
 
-    segmentHeader *headerSeg = readSegment(inputFile, fileLength);
-    
-    if(!headerSeg) {
+    blockParser parser;
+    parser.blockSizes = NULL;
+    parser.rereadSizes = true;
+    fileInfo.parser = &parser;
+
+    if(!readV1Block(&parser, inputFile, fileLength)) {
         fclose(inputFile);
         return "Malformed header segment descriptor!\n";
     }
 
-    if(headerSeg->blockSizes[0] != 0x1C) {
-        fclose(inputFile);
-        freeSegment(headerSeg);
-        return "Reported header block segment is incorrect length";
-    }
+    dsBTGAHeader header;
 
-    fileInfo.headerSegment = headerSeg;
-
-    ttfTGAHeader *header = readHeader(headerSeg);
-
-    if(!header) {
-        freeAll(fileInfo);
+    if(!processHeader(&parser, &header)) {
+        freeAll(&fileInfo);
         fclose(inputFile);
         return "Issue relating to header!\n";
     }
 
-    fileInfo.header = header;
-
-    segmentHeader *bodySeg = readSegment(inputFile, fileLength);
-
-    if(!bodySeg) {
-        freeAll(fileInfo);
+    if(!readV1Block(&parser, inputFile, fileLength)) {
+        freeAll(&fileInfo);
         fclose(inputFile);
         return "Malformed body segment descriptor!\n";
     }
 
-    fileInfo.bodySegment = bodySeg;
+    fileInfo.bodySegment = parser.blockData;
+    parser.blockData = NULL;
 
-    if(bodySeg->segmentLength != header->bodyLength) {
-        freeAll(fileInfo);
+    if(parser.dataLen != header.bodyLength) {
+        freeAll(&fileInfo);
         fclose(inputFile);
         return "Body's length does not match what is reported in header!\n";
     }
 
     uint32_t *imageData;
-    uint32_t totalRes = header->hres * header->vres;
+    uint32_t totalRes = header.hres * header.vres;
 
-    if(header->textureFormat == 7) {
+    if(header.textureFormat == DIRECT_TEXTURE) {
         fclose(inputFile);
-        imageData = convBodyDataDC((uint16_t *) bodySeg->segmentData, totalRes);
-    } else if(header->textureFormat == 5) {
-        segmentHeader *paletteSeg = readSegment(inputFile, fileLength);
-
-        if(!paletteSeg) {
-            freeAll(fileInfo);
+        imageData = convBodyDataDC((uint16_t *) fileInfo.bodySegment, totalRes);
+    } else if(header.textureFormat == COMPRESSED) {
+        if(!readV1Block(&parser, inputFile, fileLength)) {
+            freeAll(&fileInfo);
             fclose(inputFile);
             return "Malformed palette segment descriptor!\n";
         }
 
-        fileInfo.paletteSegment = paletteSeg;
+        fileInfo.paletteSegment = (uint16_t *) parser.blockData;
+        parser.blockData = NULL;
 
-        if(paletteSeg->segmentLength != header->paletteLength) {
-            freeAll(fileInfo);
+        if(parser.dataLen != header.paletteLength) {
+            freeAll(&fileInfo);
             fclose(inputFile);
             return "Palette's length does not match what is reported in header!\n";
         }
 
-        segmentHeader *paletteIndexSeg = readSegment(inputFile, fileLength);
-
-        fclose(inputFile);
-
-        if(!paletteIndexSeg) {
-            freeAll(fileInfo);
+        if(!readV1Block(&parser, inputFile, fileLength)) {
+            freeAll(&fileInfo);
+            fclose(inputFile);
             return "Malformed palette index segment descriptor!\n";
         }
 
-        fileInfo.paletteIndexSegment = paletteIndexSeg;
+        fclose(inputFile);
 
-        if(paletteIndexSeg->segmentLength != header->paletteIndexLength) {
-            freeAll(fileInfo);
+        fileInfo.paletteIndexSegment = (uint16_t *) parser.blockData;
+        parser.blockData = NULL;
+
+        if(parser.dataLen != header.paletteIndexLength) {
+            freeAll(&fileInfo);
             return "Palette index's length does not match what is reported in header!\n";
         }
 
-        if(!verifyPalettes((uint16_t *)paletteIndexSeg->segmentData, header)) {
-            freeAll(fileInfo);
+        if(!verifyPalettes(fileInfo.paletteIndexSegment, &header)) {
+            freeAll(&fileInfo);
             return "Invalid palette index used!\n";
         }
 
-        uint32_t *palette = genBasePalette(paletteSeg, 0);
+        uint32_t *palette = genBasePalette(fileInfo.paletteSegment, header.paletteLength, 0);
 
-        imageData = convBodyDataCompressed((uint32_t *) bodySeg->segmentData, &fileInfo, palette);
+        imageData = convBodyDataCompressed((uint32_t *) fileInfo.bodySegment, palette, fileInfo.paletteIndexSegment, &header);
 
         free(palette);
     } else {
-        if(!verifyColors(bodySeg->segmentData, header)) {
-            freeAll(fileInfo);
+        if(!verifyColors(fileInfo.bodySegment, &header)) {
+            freeAll(&fileInfo);
             fclose(inputFile);
             return "Invalid color index used!\n";
         }
 
-        segmentHeader *paletteSeg = readSegment(inputFile, fileLength);
-
-        fclose(inputFile);
-
-        if(!paletteSeg) {
-            freeAll(fileInfo);
+        if(!!readV1Block(&parser, inputFile, fileLength)) {
+            freeAll(&fileInfo);
+            fclose(inputFile);
             return "Malformed palette segment descriptor!\n";
         }
 
-        fileInfo.paletteSegment = paletteSeg;
+        fclose(inputFile);
 
-        if(paletteSeg->segmentLength != header->paletteLength) {
-            freeAll(fileInfo);
+        fileInfo.paletteSegment = (uint16_t *) parser.blockData;
+        parser.blockData = NULL;
+
+        if(parser.dataLen != header.paletteLength) {
+            freeAll(&fileInfo);
             return "Palette's length does not match what is reported in header!\n";
         }
 
-        uint32_t *palette = genBasePalette(paletteSeg, header->color0Transparent);
+        uint32_t *palette = genBasePalette(fileInfo.paletteSegment, header.paletteLength, header.color0Transparent);
 
-        if(header->textureFormat == 1) {
-            palette = genA3I5Palette(palette, header->paletteLength / 2);
-        } else if(header->textureFormat == 6) {
-            palette = genA5I3Palette(palette, header->paletteLength / 2);
+        if(header.textureFormat == A3I5) {
+            palette = genA3I5Palette(palette, header.paletteLength / 2);
+        } else if(header.textureFormat == A5I3) {
+            palette = genA5I3Palette(palette, header.paletteLength / 2);
         }
 
-        imageData = convBodyDataPalette(bodySeg->segmentData, palette, totalRes, header->bpp);
+        imageData = convBodyDataPalette(fileInfo.bodySegment, palette, totalRes, header.bpp);
 
         free(palette);
     }
@@ -621,7 +652,7 @@ char *tryTGAConv(char *path) {
     free(outputPath);
 
     if(!outFile) {
-        freeAll(fileInfo);
+        freeAll(&fileInfo);
         free(imageData);
 
         return "Failed to open output file!\n";
@@ -643,8 +674,8 @@ char *tryTGAConv(char *path) {
     fputc(0, outFile);
     fputc(0, outFile);
 
-    fwrite(&header->hres, 2, 1, outFile);
-    fwrite(&header->vres, 2, 1, outFile);
+    fwrite(&header.hres, 2, 1, outFile);
+    fwrite(&header.vres, 2, 1, outFile);
     
     fputc(32, outFile);
     fputc(0b00111000, outFile);
@@ -654,7 +685,7 @@ char *tryTGAConv(char *path) {
 
     fclose(outFile);
 
-    freeAll(fileInfo);
+    freeAll(&fileInfo);
 
     return NULL;
 }
