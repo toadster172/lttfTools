@@ -106,6 +106,8 @@ const uint8_t colorConv1[2]  = {0xFF, 0xFF}; // For alpha bit
                         (colorConv5[((X) & 0x7C00) >> 10]))
 
 bool readV1Block(blockParser *parser, FILE *inFile, long fileLength);
+bool readV3Block(blockParser *parser, FILE *inFile, long fileLength);
+bool readV4Block(blockParser *parser, FILE *inFile, long fileLength);
 
 void freeAll(ttfTGAFile *buffers);
 
@@ -124,24 +126,43 @@ uint32_t *convBodyDataDC(uint16_t *bodyData, uint32_t res);
 uint32_t *convBodyDataPalette(uint8_t *bodyData, uint32_t *palette, uint32_t res, uint8_t bpp);
 uint32_t *convBodyDataCompressed(uint32_t *bodyData, uint32_t *palette, uint16_t *indexTable, dsBTGAHeader *header);
 
-char *tryTGAConv(char *path);
+char *tryTGAConv(char *path, bool (*readBlock)(blockParser *, FILE *, long), long startOffset);
 
 int main(int argc, char *argv[]) {
-    if(argc != 2) {
-        printf("Format: convTGA [input directory]\n");
+    if(argc != 3) {
+        printf("Format: dsConvBTGA version input_directory\n");
         return -1;
     }
 
-    DIR *inputDir = opendir(argv[1]);
+    long startOffset = 0;
+    bool (*readBlock)(blockParser *, FILE *, long);
+
+    if(!strcmp(argv[1], "1")) {
+        readBlock = &readV1Block;
+        startOffset = 0x0C;
+    } else if(!strcmp(argv[1], "2")) {
+        readBlock = &readV1Block;
+    } else if(!strcmp(argv[1], "3")) {
+        readBlock = &readV3Block;
+    } else if(!strcmp(argv[1], "4")) {
+        readBlock = &readV4Block;
+    } else {
+        printf("Format: ./dsConvBTGA version input_directory\n"
+               "Where version is one of 1, 2, 3, or 4\n");
+    }
+
+    DIR *inputDir = opendir(argv[2]);
 
     if(!inputDir) {
         printf("Unable to open input directory!\n");
         return -1;
     }
 
-    int inputDirLen = strlen(argv[1]);
+    int inputDirLen = strlen(argv[2]);
 
     struct dirent *currentEntry;
+
+    int successCount = 0;
 
     while(1) {
         currentEntry = readdir(inputDir);
@@ -154,21 +175,25 @@ int main(int argc, char *argv[]) {
 
         char *subfilePath = malloc(inputDirLen + entryNameLen + 1);
 
-        strcpy(subfilePath, argv[1]);
+        strcpy(subfilePath, argv[2]);
         strcat(subfilePath, currentEntry->d_name);
 
-        tryTGAConv(subfilePath);
+        if(!tryTGAConv(subfilePath, readBlock, startOffset)) {
+            successCount++;
+        }
 
         free(subfilePath);
     }
 
     closedir(inputDir);
 
+    printf("Successfully converted %i files\n", successCount);
+
     return 0;
 }
 
 bool readV1Block(blockParser *parser, FILE *inFile, long fileLength) {
-    if(!parser->blockSizes) {
+    if(parser->rereadSizes) {
         long currentPos = ftell(inFile);
 
         if(currentPos + 0x08 > fileLength) {
@@ -204,11 +229,14 @@ bool readV1Block(blockParser *parser, FILE *inFile, long fileLength) {
 
         if(totalLen != parser->segmentLength) {
             free(parser->blockSizes);
+            parser->blockSizes = NULL;
+            parser->blockData = NULL;
             return false;
         }
 
         parser->sizeIndex = 0;
         parser->newSegmentFlag = true;
+        parser->rereadSizes = false;
     } else {
         parser->newSegmentFlag = false;
     }
@@ -219,6 +247,8 @@ bool readV1Block(blockParser *parser, FILE *inFile, long fileLength) {
     if(!fread(parser->blockData, parser->dataLen, 1, inFile)) {
         free(parser->blockData);
         free(parser->blockSizes);
+        parser->blockData = NULL;
+        parser->blockSizes = NULL;
         return false;
     }
 
@@ -226,8 +256,152 @@ bool readV1Block(blockParser *parser, FILE *inFile, long fileLength) {
     if(parser->sizeIndex == parser->numSizeEntries) {
         free(parser->blockSizes);
         parser->blockSizes = NULL;
+        parser->rereadSizes = true;
     }
 
+    return true;
+}
+
+bool readV3Block(blockParser *parser, FILE *inFile, long fileLength) {
+    unsigned long filePos = ftell(inFile);
+    int redirections = 0;
+
+    parser->newSegmentFlag = parser->rereadSizes;
+
+    while(parser->rereadSizes) {
+        if(redirections > 5 || filePos + 8 > fileLength) {
+            return false;
+        }
+
+        uint32_t headerInfo[2];
+        if(!fread(&headerInfo, 8, 1, inFile)) {
+            return false;
+        }
+        filePos += 8;
+
+        if(headerInfo[0] & 0xFF) {
+            fseek(inFile, headerInfo[1], SEEK_CUR);
+            filePos += headerInfo[1];
+            redirections++;
+            continue;
+        }
+
+        parser->numSizeEntries = headerInfo[0] >> 16;
+        parser->segmentLength = headerInfo[1];
+
+        if(filePos + parser->numSizeEntries * 4 + parser->segmentLength > fileLength) {
+            return false;
+        }
+
+        parser->blockSizes = malloc(parser->numSizeEntries * 4);
+        fread(parser->blockSizes, 4, parser->numSizeEntries, inFile);
+
+        uint32_t totalLen = 0;
+        for(int i = 0; i < parser->numSizeEntries; i++) {
+            totalLen += parser->blockSizes[i];
+        }
+
+        if(totalLen != parser->segmentLength) {
+            free(parser->blockSizes);
+            parser->blockSizes = NULL;
+            parser->blockData = NULL;
+            return false;
+        }
+
+        parser->sizeIndex = 0;
+        parser->rereadSizes = false;
+    }
+
+    parser->dataLen = parser->blockSizes[parser->sizeIndex];
+    parser->blockData = malloc(parser->dataLen);
+    
+    if(!fread(parser->blockData, parser->dataLen, 1, inFile)) {
+        free(parser->blockData);
+        free(parser->blockSizes);
+        parser->blockData = NULL;
+        parser->blockSizes = NULL;
+        return false;
+    }
+
+    parser->sizeIndex++;
+    if(parser->sizeIndex == parser->numSizeEntries) {
+        free(parser->blockSizes);
+        parser->blockSizes = NULL;
+        parser->rereadSizes = true;
+    }
+
+    return true;
+}
+
+bool readV4Block(blockParser *parser, FILE *inFile, long fileLength) {
+    unsigned long filePos = ftell(inFile);
+    int redirections = 0;
+
+    while(parser->rereadSizes) {
+        if(redirections > 5 || filePos + 8 > fileLength) {
+            return false;
+        }
+
+        uint32_t headerInfo[2];
+        if(!fread(&headerInfo, 8, 1, inFile)) {
+            return false;
+        }
+        filePos += 8;
+
+        if(headerInfo[0] & 0xFF) {
+            fseek(inFile, headerInfo[1], SEEK_CUR);
+            filePos += headerInfo[1];
+            redirections++;
+            continue;
+        }
+
+        parser->numSizeEntries = headerInfo[0] >> 8;
+        uint32_t blockSizesLength = headerInfo[1];
+
+        if(parser->numSizeEntries * 4 != blockSizesLength || filePos + parser->numSizeEntries * 4 > fileLength) {
+            return false;
+        }
+
+        parser->blockSizes = malloc(blockSizesLength);
+        fread(parser->blockSizes, blockSizesLength, 1, inFile);
+        filePos += blockSizesLength;
+        parser->sizeIndex = 0;
+        parser->rereadSizes = false;
+    }
+
+    if(parser->sizeIndex >= parser->numSizeEntries) {
+        free(parser->blockSizes);
+        parser->blockSizes = NULL;
+        return false;
+    }
+
+    int32_t blockMagic = parser->blockSizes[parser->sizeIndex];
+    parser->sizeIndex++;
+    if(blockMagic < -0x10 || blockMagic > -0x0E) {
+        free(parser->blockSizes);
+        return false;
+    }
+
+    parser->sizesInBlock = 0;
+    parser->dataLen = 0;
+
+    while(parser->sizeIndex < parser->numSizeEntries) {
+        int32_t blockSize = parser->blockSizes[parser->sizeIndex];
+        if(blockSize >= -0x10 && blockSize <= -0x0E) {
+            break;
+        }
+        parser->sizesInBlock++;
+        parser->dataLen += blockSize;
+        parser->sizeIndex++;
+    }
+
+    if(filePos + parser->dataLen > fileLength) {
+        free(parser->blockSizes);
+        return false;
+    }
+
+    parser->blockData = malloc(parser->dataLen);
+    fread(parser->blockData, parser->dataLen, 1, inFile);
     return true;
 }
 
@@ -309,8 +483,8 @@ bool processHeader(blockParser *source, dsBTGAHeader *header) {
             return false;
     }
 
-    header->hres = 8 << header->hwidth;
-    header->vres = 8 << header->hheight;
+    header->hres = 8 << (header->hwidth & 0x07);
+    header->vres = 8 << (header->hheight & 0x07);
 
     // Body length not matching resolution
     if(header->hres * header->vres * header->bpp != header->bodyLength * 8) {
@@ -504,7 +678,7 @@ uint32_t *convBodyDataCompressed(uint32_t *bodyData, uint32_t *palette, uint16_t
     return imageData;
 }
 
-char *tryTGAConv(char *path) {
+char *tryTGAConv(char *path, bool (*readBlock)(blockParser *, FILE *, long), long startOffset) {
     FILE *inputFile = fopen(path, "rb");
 
     if(!inputFile) {
@@ -513,7 +687,7 @@ char *tryTGAConv(char *path) {
 
     fseek(inputFile, 0, SEEK_END);
     long fileLength = ftell(inputFile);
-    fseek(inputFile, 0, SEEK_SET);
+    fseek(inputFile, startOffset, SEEK_SET);
 
     // Minimum header length
     if(fileLength < 0x28) {
@@ -529,7 +703,7 @@ char *tryTGAConv(char *path) {
     parser.rereadSizes = true;
     fileInfo.parser = &parser;
 
-    if(!readV1Block(&parser, inputFile, fileLength)) {
+    if(!readBlock(&parser, inputFile, fileLength)) {
         fclose(inputFile);
         return "Malformed header segment descriptor!\n";
     }
@@ -542,7 +716,7 @@ char *tryTGAConv(char *path) {
         return "Issue relating to header!\n";
     }
 
-    if(!readV1Block(&parser, inputFile, fileLength)) {
+    if(!readBlock(&parser, inputFile, fileLength)) {
         freeAll(&fileInfo);
         fclose(inputFile);
         return "Malformed body segment descriptor!\n";
@@ -564,7 +738,7 @@ char *tryTGAConv(char *path) {
         fclose(inputFile);
         imageData = convBodyDataDC((uint16_t *) fileInfo.bodySegment, totalRes);
     } else if(header.textureFormat == COMPRESSED) {
-        if(!readV1Block(&parser, inputFile, fileLength)) {
+        if(!readBlock(&parser, inputFile, fileLength)) {
             freeAll(&fileInfo);
             fclose(inputFile);
             return "Malformed palette segment descriptor!\n";
@@ -579,7 +753,7 @@ char *tryTGAConv(char *path) {
             return "Palette's length does not match what is reported in header!\n";
         }
 
-        if(!readV1Block(&parser, inputFile, fileLength)) {
+        if(!readBlock(&parser, inputFile, fileLength)) {
             freeAll(&fileInfo);
             fclose(inputFile);
             return "Malformed palette index segment descriptor!\n";
@@ -612,7 +786,7 @@ char *tryTGAConv(char *path) {
             return "Invalid color index used!\n";
         }
 
-        if(!!readV1Block(&parser, inputFile, fileLength)) {
+        if(!readBlock(&parser, inputFile, fileLength)) {
             freeAll(&fileInfo);
             fclose(inputFile);
             return "Malformed palette segment descriptor!\n";
