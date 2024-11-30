@@ -149,6 +149,7 @@ int main(int argc, char *argv[]) {
     } else {
         printf("Format: ./dsConvBTGA version input_directory\n"
                "Where version is one of 1, 2, 3, or 4\n");
+        return -1;
     }
 
     DIR *inputDir = opendir(argv[2]);
