@@ -23,15 +23,6 @@
 #include <string.h>
 #include <dirent.h>
 
-// typedef struct _segmentHeader {
-//     uint16_t totalBlocks;
-//     uint8_t padding[2];
-//     uint32_t segmentLength;
-// 
-//     uint32_t *blockSizes;
-//     uint8_t *segmentData;
-// } segmentHeader;
-
 typedef struct _blockParser {
     bool rereadSizes;
     // Structural info
@@ -174,9 +165,10 @@ int main(int argc, char *argv[]) {
 
         int entryNameLen = strlen(currentEntry->d_name);
 
-        char *subfilePath = malloc(inputDirLen + entryNameLen + 1);
+        char *subfilePath = malloc(inputDirLen + entryNameLen + 2);
 
         strcpy(subfilePath, argv[2]);
+        strcat(subfilePath, "/");
         strcat(subfilePath, currentEntry->d_name);
 
         if(!tryTGAConv(subfilePath, readBlock, startOffset)) {
